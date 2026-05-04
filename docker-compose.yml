@@ -1,0 +1,13 @@
+services:
+  resolver:
+    build: ./resolver
+    container_name: resolver
+    ports:
+      - "33053:33053/udp"
+    volumes:
+      - ./resolver:/app
+      - resolver-target:/app/target
+    restart: unless-stopped
+
+volumes:
+  resolver-target:
