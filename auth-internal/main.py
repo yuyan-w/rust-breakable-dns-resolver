@@ -1,6 +1,7 @@
 import os
 import socket
 import time
+import threading
 
 import yaml
 from dnslib import DNSRecord, RR, A, QTYPE, RCODE
@@ -83,6 +84,21 @@ def apply_mode(mode: str) -> bool:
 
     return True
 
+def handle_request(sock, data, addr, records, mode):
+    try:
+        request = DNSRecord.parse(data)
+    except Exception as error:
+        print(f"parse error: {error}")
+        return
+
+    should_respond = apply_mode(mode)
+    if not should_respond:
+        return
+
+    response = build_response(request, records)
+    sock.sendto(response.pack(), addr)
+
+    print(f"sent response to {addr}")
 
 def main() -> None:
     mode = os.getenv("AUTH_MODE", "normal")
@@ -97,22 +113,12 @@ def main() -> None:
 
     while True:
         data, addr = sock.recvfrom(512)
-        print(f"received {len(data)} bytes from {addr}")
 
-        try:
-            request = DNSRecord.parse(data)
-        except Exception as error:
-            print(f"parse error: {error}")
-            continue
-
-        should_respond = apply_mode(mode)
-        if not should_respond:
-            continue
-
-        response = build_response(request, records)
-        sock.sendto(response.pack(), addr)
-
-        print(f"sent response to {addr}")
+        thread = threading.Thread(
+            target=handle_request,
+            args=(sock, data, addr, records, mode),
+        )
+        thread.start()
 
 
 if __name__ == "__main__":
