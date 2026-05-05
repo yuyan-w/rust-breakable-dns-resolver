@@ -8,6 +8,16 @@ services:
       - ./resolver:/app
       - resolver-target:/app/target
     restart: unless-stopped
+  auth-internal:
+    build: ./auth-internal
+    container_name: auth-internal
+    ports:
+      - "33054:33053/udp"
+    volumes:
+      - ./auth-internal:/app
+    environment:
+      AUTH_MODE: ${AUTH_MODE:-normal}
+    restart: unless-stopped
 
 volumes:
   resolver-target:

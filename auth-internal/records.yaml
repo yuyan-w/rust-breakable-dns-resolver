@@ -1,0 +1,10 @@
+records:
+  - name: internal.test
+    type: A
+    value: 10.0.100.1
+    ttl: 30
+
+  - name: api.internal.test
+    type: A
+    value: 10.0.100.2
+    ttl: 30
