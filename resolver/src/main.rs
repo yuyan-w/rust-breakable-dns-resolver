@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 mod dns;
 
 const MAX_WORKERS: usize = 16;
+const NEGATIVE_CACHE_TTL: u32 = 10;
 
 type Cache = Arc<Mutex<HashMap<CacheKey, CacheEntry>>>;
 
@@ -93,6 +94,17 @@ fn main() -> std::io::Result<()> {
                                         ttl,
                                     },
                                 );
+                            } else if is_nxdomain_response(&response) {
+                                println!("negative cache store: ttl={} sec", NEGATIVE_CACHE_TTL);
+
+                                cache.lock().unwrap().insert(
+                                    cache_key,
+                                    CacheEntry {
+                                        response: response.clone(),
+                                        stored_at: Instant::now(),
+                                        ttl: NEGATIVE_CACHE_TTL,
+                                    },
+                                );
                             }
 
                             socket.send_to(&response, source).unwrap();
@@ -151,6 +163,17 @@ fn remaining_ttl(entry: &CacheEntry) -> u32 {
     let elapsed = entry.stored_at.elapsed().as_secs() as u32;
 
     entry.ttl.saturating_sub(elapsed)
+}
+
+/// DNSレスポンスがNXDOMAINか確認する
+fn is_nxdomain_response(response: &[u8]) -> bool {
+    if response.len() < 4 {
+        return false;
+    }
+
+    let rcode = response[3] & 0x0f;
+
+    rcode == 3
 }
 
 /// DNSレスポンスからTTLを取得する
