@@ -95,7 +95,21 @@ fn main() -> std::io::Result<()> {
                                     },
                                 );
                             } else if is_nxdomain_response(&response) {
-                                println!("negative cache store: ttl={} sec", NEGATIVE_CACHE_TTL);
+                                println!("negative cache store: nxdomain ttl={} sec", NEGATIVE_CACHE_TTL);
+
+                                cache.lock().unwrap().insert(
+                                    cache_key,
+                                    CacheEntry {
+                                        response: response.clone(),
+                                        stored_at: Instant::now(),
+                                        ttl: NEGATIVE_CACHE_TTL,
+                                    },
+                                );
+                            } else if is_nodata_response(&response) {
+                                println!(
+                                    "negative cache store: nodata ttl={} sec",
+                                    NEGATIVE_CACHE_TTL
+                                );
 
                                 cache.lock().unwrap().insert(
                                     cache_key,
@@ -174,6 +188,18 @@ fn is_nxdomain_response(response: &[u8]) -> bool {
     let rcode = response[3] & 0x0f;
 
     rcode == 3
+}
+
+/// DNSレスポンスがNODATAか確認する
+fn is_nodata_response(response: &[u8]) -> bool {
+    if response.len() < 12 {
+        return false;
+    }
+
+    let rcode = response[3] & 0x0f;
+    let ancount = u16::from_be_bytes([response[6], response[7]]);
+
+    rcode == 0 && ancount == 0
 }
 
 /// DNSレスポンスからTTLを取得する
