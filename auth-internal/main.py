@@ -52,6 +52,13 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
     record = records.get((qname, qtype))
 
     if record is None:
+        name_exists = any(name == qname for name, _ in records.keys())
+
+        if name_exists:
+            response.header.rcode = RCODE.NOERROR
+            print(f"NODATA name={qname} type={qtype}")
+            return response
+
         response.header.rcode = RCODE.NXDOMAIN
         print(f"NXDOMAIN name={qname}")
         return response
