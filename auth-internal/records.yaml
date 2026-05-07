@@ -8,3 +8,8 @@ records:
     type: A
     value: 10.0.100.2
     ttl: 30
+
+  - name: dev.internal.test
+    type: NS
+    value: ns1.dev.internal.test
+    ttl: 30

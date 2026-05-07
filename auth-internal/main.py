@@ -4,8 +4,7 @@ import time
 import threading
 
 import yaml
-from dnslib import DNSRecord, RR, A, QTYPE, RCODE
-
+from dnslib import DNSRecord, RR, A, NS, QTYPE, RCODE
 
 LISTEN_ADDR = "0.0.0.0"
 LISTEN_PORT = 33053
@@ -14,6 +13,17 @@ RECORDS_FILE = "records.yaml"
 
 def normalize_name(name: str) -> str:
     return name.rstrip(".").lower()
+
+
+def find_delegation(qname: str, records: dict[tuple[str, str], dict]):
+    for (name, record_type), record in records.items():
+        if record_type != "NS":
+            continue
+
+        if qname == name or qname.endswith("." + name):
+            return name, record
+
+    return None
 
 
 def load_records() -> dict[tuple[str, str], dict]:
@@ -52,6 +62,24 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
     record = records.get((qname, qtype))
 
     if record is None:
+        delegation = find_delegation(qname, records)
+
+        if delegation is not None:
+            delegated_name, ns_record = delegation
+
+            response.header.rcode = RCODE.NOERROR
+            response.add_auth(
+                RR(
+                    rname=delegated_name + ".",
+                    rtype=QTYPE.NS,
+                    rclass=1,
+                    ttl=ns_record["ttl"],
+                    rdata=NS(ns_record["value"]),
+                )
+            )
+            print(f"delegation name={delegated_name} ns={ns_record['value']}")
+            return response
+        
         name_exists = any(name == qname for name, _ in records.keys())
 
         if name_exists:
