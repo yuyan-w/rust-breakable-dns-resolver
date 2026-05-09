@@ -20,6 +20,16 @@ services:
     environment:
       AUTH_MODE: ${AUTH_MODE:-normal}
     restart: unless-stopped
+  auth-dev:
+    build: ./auth-dev
+    container_name: auth-dev
+    ports:
+      - "33055:33053/udp"
+    volumes:
+      - ./auth-dev:/app
+    environment:
+      AUTH_MODE: ${AUTH_MODE:-normal}
+    restart: unless-stopped
 
 volumes:
   resolver-target:
