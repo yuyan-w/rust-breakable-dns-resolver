@@ -9,6 +9,7 @@ services:
       - resolver-target:/app/target
     environment:
       AUTH_INTERNAL_ADDR: auth-internal:33053
+      AUTH_DEV_ADDR: auth-dev:33053
     restart: unless-stopped
   auth-internal:
     build: ./auth-internal

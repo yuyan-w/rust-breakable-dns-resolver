@@ -32,7 +32,11 @@ fn main() -> std::io::Result<()> {
     let auth_internal_addr =
         std::env::var("AUTH_INTERNAL_ADDR").unwrap_or_else(|_| "auth-internal:33053".to_string());
 
+    let auth_dev_addr =
+        std::env::var("AUTH_DEV_ADDR").unwrap_or_else(|_| "auth-dev:33053".to_string());
+
     println!("auth internal addr: {}", auth_internal_addr);
+    println!("auth dev addr: {}", auth_dev_addr);
 
     let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
 
@@ -48,6 +52,7 @@ fn main() -> std::io::Result<()> {
         let tx = tx.clone();
         let rx = Arc::clone(&rx);
         let auth_internal_addr = auth_internal_addr.clone();
+        let auth_dev_addr = auth_dev_addr.clone();
         let cache = Arc::clone(&cache);
 
         thread::spawn(move || {
@@ -81,7 +86,7 @@ fn main() -> std::io::Result<()> {
 
                     println!("cache miss");
 
-                    match forward_to_auth(&auth_internal_addr, &request) {
+                    match resolve_with_delegation(&auth_internal_addr, &auth_dev_addr, &request) {
                         Ok(response) => {
                             if let Some(ttl) = extract_answer_ttl(&response) {
                                 println!("cache store: ttl={} sec", ttl);
@@ -95,7 +100,10 @@ fn main() -> std::io::Result<()> {
                                     },
                                 );
                             } else if is_nxdomain_response(&response) {
-                                println!("negative cache store: nxdomain ttl={} sec", NEGATIVE_CACHE_TTL);
+                                println!(
+                                    "negative cache store: nxdomain ttl={} sec",
+                                    NEGATIVE_CACHE_TTL
+                                );
 
                                 cache.lock().unwrap().insert(
                                     cache_key,
@@ -124,7 +132,7 @@ fn main() -> std::io::Result<()> {
                             socket.send_to(&response, source).unwrap();
                         }
                         Err(error) => {
-                            println!("failed to forward request: {}", error);
+                            println!("failed to resolve request: {}", error);
                         }
                     }
                 }
@@ -136,6 +144,22 @@ fn main() -> std::io::Result<()> {
             rx.lock().unwrap().recv().unwrap();
         });
     }
+}
+
+/// auth-internalへ問い合わせ、referral応答であればauth-devへ問い合わせを続行する
+fn resolve_with_delegation(
+    auth_internal_addr: &str,
+    auth_dev_addr: &str,
+    request: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let response = forward_to_auth(auth_internal_addr, request)?;
+
+    if is_referral_response(&response) {
+        println!("referral response found. retry with auth-dev");
+        return forward_to_auth(auth_dev_addr, request);
+    }
+
+    Ok(response)
 }
 
 /// 権威DNSへ問い合わせを行い、レスポンスを取得する
@@ -179,6 +203,19 @@ fn remaining_ttl(entry: &CacheEntry) -> u32 {
     entry.ttl.saturating_sub(elapsed)
 }
 
+/// DNSレスポンスがreferral応答か確認する
+fn is_referral_response(response: &[u8]) -> bool {
+    if response.len() < 12 {
+        return false;
+    }
+
+    let rcode = response[3] & 0x0f;
+    let ancount = u16::from_be_bytes([response[6], response[7]]);
+    let nscount = u16::from_be_bytes([response[8], response[9]]);
+
+    rcode == 0 && ancount == 0 && nscount > 0
+}
+
 /// DNSレスポンスがNXDOMAINか確認する
 fn is_nxdomain_response(response: &[u8]) -> bool {
     if response.len() < 4 {
@@ -198,8 +235,9 @@ fn is_nodata_response(response: &[u8]) -> bool {
 
     let rcode = response[3] & 0x0f;
     let ancount = u16::from_be_bytes([response[6], response[7]]);
+    let nscount = u16::from_be_bytes([response[8], response[9]]);
 
-    rcode == 0 && ancount == 0
+    rcode == 0 && ancount == 0 && nscount == 0
 }
 
 /// DNSレスポンスからTTLを取得する
