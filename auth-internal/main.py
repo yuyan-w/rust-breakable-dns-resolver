@@ -44,6 +44,33 @@ def load_records() -> dict[tuple[str, str], dict]:
     return records
 
 
+def add_glue_record(
+    response: DNSRecord,
+    ns_name: str,
+    records: dict[tuple[str, str], dict],
+) -> None:
+    normalized_ns_name = normalize_name(ns_name)
+    glue_record = records.get((normalized_ns_name, "A"))
+
+    if glue_record is None:
+        print(f"glue not found ns={normalized_ns_name}")
+        return
+
+    response.add_ar(
+        RR(
+            rname=normalized_ns_name + ".",
+            rtype=QTYPE.A,
+            rclass=1,
+            ttl=glue_record["ttl"],
+            rdata=A(glue_record["value"]),
+        )
+    )
+
+    print(
+        f"glue name={normalized_ns_name} "
+        f"value={glue_record['value']}"
+    )
+
 def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> DNSRecord:
     question = request.q
     qname = normalize_name(str(question.qname))
@@ -77,6 +104,9 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
                     rdata=NS(ns_record["value"]),
                 )
             )
+
+            add_glue_record(response, ns_record["value"], records)
+
             print(f"delegation name={delegated_name} ns={ns_record['value']}")
             return response
         

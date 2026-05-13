@@ -13,3 +13,8 @@ records:
     type: NS
     value: ns1.dev.internal.test
     ttl: 30
+
+  - name: ns1.dev.internal.test
+    type: A
+    value: 10.0.0.20
+    ttl: 30

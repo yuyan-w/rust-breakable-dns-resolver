@@ -8,8 +8,11 @@ services:
       - ./resolver:/app
       - resolver-target:/app/target
     environment:
-      AUTH_INTERNAL_ADDR: auth-internal:33053
-      AUTH_DEV_ADDR: auth-dev:33053
+      AUTH_INTERNAL_ADDR: 10.0.0.10:33053
+      AUTH_DEV_ADDR: 10.0.0.20:33053
+    networks:
+      dns-lab:
+        ipv4_address: 10.0.0.2
     restart: unless-stopped
   auth-internal:
     build: ./auth-internal
@@ -20,6 +23,9 @@ services:
       - ./auth-internal:/app
     environment:
       AUTH_MODE: ${AUTH_MODE:-normal}
+    networks:
+      dns-lab:
+        ipv4_address: 10.0.0.10
     restart: unless-stopped
   auth-dev:
     build: ./auth-dev
@@ -30,7 +36,17 @@ services:
       - ./auth-dev:/app
     environment:
       AUTH_MODE: ${AUTH_MODE:-normal}
+    networks:
+      dns-lab:
+        ipv4_address: 10.0.0.20
     restart: unless-stopped
 
 volumes:
   resolver-target:
+
+networks:
+  dns-lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24
