@@ -142,7 +142,7 @@ fn main() -> std::io::Result<()> {
 }
 
 /// auth-internalへ問い合わせし、
-/// Glueレコードがあれば委任先DNSへ問い合わせを続行する
+/// 委任先NSと一致するGlueレコードがあれば問い合わせを続行する
 fn resolve_with_delegation(auth_internal_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
     let response = forward_to_auth(auth_internal_addr, request)?;
 
@@ -152,27 +152,196 @@ fn resolve_with_delegation(auth_internal_addr: &str, request: &[u8]) -> std::io:
 
     println!("referral response found");
 
-    let Some(glue_addr) = extract_glue_address(&response) else {
-        println!("glue record not found");
+    let Some(glue_addr) = extract_trusted_glue_address(&response) else {
+        println!("trusted glue record not found");
         return Ok(response);
     };
 
-    println!("glue address found: {}", glue_addr);
+    println!("trusted glue address found: {}", glue_addr);
 
     forward_to_auth(&glue_addr, request)
 }
 
-/// Additional section からGlueレコードのIPを取得する
-fn extract_glue_address(response: &[u8]) -> Option<String> {
-    if response.len() < 4 {
+/// AUTHORITY section のNS名と一致するAdditionalのAレコードだけをGlueとして利用する
+fn extract_trusted_glue_address(response: &[u8]) -> Option<String> {
+    let ns_name = extract_authority_ns_name(response)?;
+    let (glue_name, glue_ip) = extract_additional_a_record(response)?;
+
+    if ns_name != glue_name {
+        println!(
+            "untrusted glue ignored: ns={} additional={}",
+            ns_name, glue_name
+        );
         return None;
     }
 
-    let ip = &response[response.len() - 4..];
+    Some(format!(
+        "{}.{}.{}.{}:33053",
+        glue_ip[0], glue_ip[1], glue_ip[2], glue_ip[3]
+    ))
+}
 
-    let addr = format!("{}.{}.{}.{}:33053", ip[0], ip[1], ip[2], ip[3],);
+fn extract_authority_ns_name(packet: &[u8]) -> Option<String> {
+    let mut offset = skip_question(packet)?;
 
-    Some(addr)
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let nscount = u16::from_be_bytes([packet[8], packet[9]]) as usize;
+
+    for _ in 0..ancount {
+        offset = skip_rr(packet, offset)?;
+    }
+
+    for _ in 0..nscount {
+        let (_owner_name, next_offset) = read_dns_name(packet, offset)?;
+        offset = next_offset;
+
+        if offset + 10 > packet.len() {
+            return None;
+        }
+
+        let rr_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+        let rdata_offset = offset + 10;
+
+        if rdata_offset + rdlength > packet.len() {
+            return None;
+        }
+
+        if rr_type == 2 {
+            let (ns_name, _) = read_dns_name(packet, rdata_offset)?;
+            return Some(ns_name);
+        }
+
+        offset = rdata_offset + rdlength;
+    }
+
+    None
+}
+
+fn extract_additional_a_record(packet: &[u8]) -> Option<(String, [u8; 4])> {
+    let mut offset = skip_question(packet)?;
+
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let nscount = u16::from_be_bytes([packet[8], packet[9]]) as usize;
+    let arcount = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+
+    for _ in 0..ancount {
+        offset = skip_rr(packet, offset)?;
+    }
+
+    for _ in 0..nscount {
+        offset = skip_rr(packet, offset)?;
+    }
+
+    for _ in 0..arcount {
+        let (name, next_offset) = read_dns_name(packet, offset)?;
+        offset = next_offset;
+
+        if offset + 10 > packet.len() {
+            return None;
+        }
+
+        let rr_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let rr_class = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+        let rdata_offset = offset + 10;
+
+        if rdata_offset + rdlength > packet.len() {
+            return None;
+        }
+
+        if rr_type == 1 && rr_class == 1 && rdlength == 4 {
+            return Some((
+                name,
+                [
+                    packet[rdata_offset],
+                    packet[rdata_offset + 1],
+                    packet[rdata_offset + 2],
+                    packet[rdata_offset + 3],
+                ],
+            ));
+        }
+
+        offset = rdata_offset + rdlength;
+    }
+
+    None
+}
+
+fn skip_question(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 12 {
+        return None;
+    }
+
+    let (_qname, offset) = read_dns_name(packet, 12)?;
+
+    if offset + 4 > packet.len() {
+        return None;
+    }
+
+    Some(offset + 4)
+}
+
+fn skip_rr(packet: &[u8], offset: usize) -> Option<usize> {
+    let (_name, mut offset) = read_dns_name(packet, offset)?;
+
+    if offset + 10 > packet.len() {
+        return None;
+    }
+
+    let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+    offset += 10;
+
+    if offset + rdlength > packet.len() {
+        return None;
+    }
+
+    Some(offset + rdlength)
+}
+
+fn read_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
+    let mut labels = Vec::new();
+    let mut jumped = false;
+    let original_offset = offset;
+
+    loop {
+        if offset >= packet.len() {
+            return None;
+        }
+
+        let len = packet[offset];
+
+        if len & 0b1100_0000 == 0b1100_0000 {
+            if offset + 1 >= packet.len() {
+                return None;
+            }
+
+            let pointer = (((len & 0b0011_1111) as usize) << 8) | packet[offset + 1] as usize;
+
+            offset = pointer;
+            jumped = true;
+            continue;
+        }
+
+        offset += 1;
+
+        if len == 0 {
+            break;
+        }
+
+        let label_len = len as usize;
+
+        if offset + label_len > packet.len() {
+            return None;
+        }
+
+        labels.push(String::from_utf8_lossy(&packet[offset..offset + label_len]).to_string());
+        offset += label_len;
+    }
+
+    let next_offset = if jumped { original_offset + 2 } else { offset };
+
+    Some((labels.join(".").to_lowercase(), next_offset))
 }
 
 /// 権威DNSへ問い合わせを行い、レスポンスを取得する
