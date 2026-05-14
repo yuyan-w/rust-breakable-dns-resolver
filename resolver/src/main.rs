@@ -32,11 +32,7 @@ fn main() -> std::io::Result<()> {
     let auth_internal_addr =
         std::env::var("AUTH_INTERNAL_ADDR").unwrap_or_else(|_| "auth-internal:33053".to_string());
 
-    let auth_dev_addr =
-        std::env::var("AUTH_DEV_ADDR").unwrap_or_else(|_| "auth-dev:33053".to_string());
-
     println!("auth internal addr: {}", auth_internal_addr);
-    println!("auth dev addr: {}", auth_dev_addr);
 
     let cache: Cache = Arc::new(Mutex::new(HashMap::new()));
 
@@ -52,7 +48,6 @@ fn main() -> std::io::Result<()> {
         let tx = tx.clone();
         let rx = Arc::clone(&rx);
         let auth_internal_addr = auth_internal_addr.clone();
-        let auth_dev_addr = auth_dev_addr.clone();
         let cache = Arc::clone(&cache);
 
         thread::spawn(move || {
@@ -86,7 +81,7 @@ fn main() -> std::io::Result<()> {
 
                     println!("cache miss");
 
-                    match resolve_with_delegation(&auth_internal_addr, &auth_dev_addr, &request) {
+                    match resolve_with_delegation(&auth_internal_addr, &request) {
                         Ok(response) => {
                             if let Some(ttl) = extract_answer_ttl(&response) {
                                 println!("cache store: ttl={} sec", ttl);
@@ -146,20 +141,38 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-/// auth-internalへ問い合わせ、referral応答であればauth-devへ問い合わせを続行する
-fn resolve_with_delegation(
-    auth_internal_addr: &str,
-    auth_dev_addr: &str,
-    request: &[u8],
-) -> std::io::Result<Vec<u8>> {
+/// auth-internalへ問い合わせし、
+/// Glueレコードがあれば委任先DNSへ問い合わせを続行する
+fn resolve_with_delegation(auth_internal_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
     let response = forward_to_auth(auth_internal_addr, request)?;
 
-    if is_referral_response(&response) {
-        println!("referral response found. retry with auth-dev");
-        return forward_to_auth(auth_dev_addr, request);
+    if !is_referral_response(&response) {
+        return Ok(response);
     }
 
-    Ok(response)
+    println!("referral response found");
+
+    let Some(glue_addr) = extract_glue_address(&response) else {
+        println!("glue record not found");
+        return Ok(response);
+    };
+
+    println!("glue address found: {}", glue_addr);
+
+    forward_to_auth(&glue_addr, request)
+}
+
+/// Additional section からGlueレコードのIPを取得する
+fn extract_glue_address(response: &[u8]) -> Option<String> {
+    if response.len() < 4 {
+        return None;
+    }
+
+    let ip = &response[response.len() - 4..];
+
+    let addr = format!("{}.{}.{}.{}:33053", ip[0], ip[1], ip[2], ip[3],);
+
+    Some(addr)
 }
 
 /// 権威DNSへ問い合わせを行い、レスポンスを取得する
