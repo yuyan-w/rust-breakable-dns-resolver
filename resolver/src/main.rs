@@ -8,6 +8,7 @@ mod dns;
 
 const MAX_WORKERS: usize = 16;
 const NEGATIVE_CACHE_TTL: u32 = 10;
+const MAX_CNAME_DEPTH: usize = 5;
 
 type Cache = Arc<Mutex<HashMap<CacheKey, CacheEntry>>>;
 
@@ -194,57 +195,82 @@ fn resolve_cname_if_needed(
 
     println!("nodata response found. try cname lookup: {}", qname);
 
-    let Some((cname_answers, a_answer)) =
-        resolve_cname_chain(auth_internal_addr, request, &qname, qclass)?
-    else {
-        return Ok(None);
-    };
+    match resolve_cname_chain(auth_internal_addr, request, &qname, qclass)? {
+        CnameChainResult::Resolved {
+            cname_answers,
+            a_answer,
+        } => {
+            let response =
+                build_cname_chain_a_response(request, qclass, &cname_answers, &a_answer)?;
+            Ok(Some(response))
+        }
+        CnameChainResult::NotFound => Ok(None),
+        CnameChainResult::TooDeep { last_name } => {
+            println!(
+                "cname chain too deep: max_depth={} last_name={}",
+                MAX_CNAME_DEPTH, last_name
+            );
 
-    let response = build_cname_chain_a_response(request, qclass, &cname_answers, &a_answer)?;
+            let response = build_servfail_response(request)?;
+            Ok(Some(response))
+        }
+    }
+}
 
-    Ok(Some(response))
+#[derive(Debug)]
+enum CnameChainResult {
+    Resolved {
+        cname_answers: Vec<CnameAnswer>,
+        a_answer: AAnswer,
+    },
+    NotFound,
+    TooDeep {
+        last_name: String,
+    },
 }
 
 /// CNAMEの追跡先もCNAMEだった場合、さらに追跡する。
-/// この段階では、あえて追跡回数の上限を設けない。
+/// ただし無制限に追跡するとloopで終わらないため、最大追跡回数を設ける。
 fn resolve_cname_chain(
     auth_internal_addr: &str,
     original_request: &[u8],
     start_name: &str,
     qclass: u16,
-) -> std::io::Result<Option<(Vec<CnameAnswer>, AAnswer)>> {
+) -> std::io::Result<CnameChainResult> {
     let mut current_name = start_name.to_string();
     let mut cname_answers = Vec::new();
 
-    loop {
+    for depth in 0..MAX_CNAME_DEPTH {
         let cname_request = build_query_request(original_request, &current_name, 5, qclass)?;
         let cname_response = resolve_once_with_delegation(auth_internal_addr, &cname_request)?;
 
         let Some(cname_answer) = extract_cname_answer(&cname_response) else {
             println!("cname not found: {}", current_name);
-            return Ok(None);
+            return Ok(CnameChainResult::NotFound);
         };
 
         println!(
-            "cname found: {} -> {}",
-            cname_answer.name, cname_answer.target_name
+            "cname found: depth={} {} -> {}",
+            depth + 1,
+            cname_answer.name,
+            cname_answer.target_name
         );
 
-        let a_request = build_query_request(original_request, &cname_answer.target_name, 1, qclass)?;
+        let a_request =
+            build_query_request(original_request, &cname_answer.target_name, 1, qclass)?;
         let a_response = resolve_once_with_delegation(auth_internal_addr, &a_request)?;
 
         if let Some(a_answer) = extract_a_answer(&a_response) {
             println!(
                 "cname target a found: {} -> {}.{}.{}.{}",
-                a_answer.name,
-                a_answer.ip[0],
-                a_answer.ip[1],
-                a_answer.ip[2],
-                a_answer.ip[3]
+                a_answer.name, a_answer.ip[0], a_answer.ip[1], a_answer.ip[2], a_answer.ip[3]
             );
 
             cname_answers.push(cname_answer);
-            return Ok(Some((cname_answers, a_answer)));
+            return Ok(CnameChainResult::Resolved {
+                cname_answers,
+                a_answer,
+            });
         }
 
         println!(
@@ -255,6 +281,10 @@ fn resolve_cname_chain(
         current_name = cname_answer.target_name.clone();
         cname_answers.push(cname_answer);
     }
+
+    Ok(CnameChainResult::TooDeep {
+        last_name: current_name,
+    })
 }
 
 #[derive(Debug)]
@@ -371,6 +401,29 @@ fn build_cname_chain_a_response(
     response.extend_from_slice(&a_answer.ttl.to_be_bytes());
     response.extend_from_slice(&4u16.to_be_bytes());
     response.extend_from_slice(&a_answer.ip);
+
+    Ok(response)
+}
+
+fn build_servfail_response(original_request: &[u8]) -> std::io::Result<Vec<u8>> {
+    let question_end = skip_question(original_request).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid dns question")
+    })?;
+
+    let mut response = Vec::new();
+
+    response.extend_from_slice(&original_request[0..2]);
+
+    // QR=1, AA=1, RDは元リクエストから引き継ぐ。RCODE=2(SERVFAIL)。
+    response.push(0x84 | (original_request[2] & 0x01));
+    response.push(0x02);
+
+    response.extend_from_slice(&1u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+
+    response.extend_from_slice(&original_request[12..question_end]);
 
     Ok(response)
 }
