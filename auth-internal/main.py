@@ -4,7 +4,7 @@ import time
 import threading
 
 import yaml
-from dnslib import DNSRecord, RR, A, NS, QTYPE, RCODE
+from dnslib import DNSRecord, RR, A, NS, CNAME, QTYPE, RCODE
 
 LISTEN_ADDR = "0.0.0.0"
 LISTEN_PORT = 33053
@@ -132,6 +132,24 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
             )
         )
         print(f"answer name={qname} value={record['value']}")
+        return response
+
+    if qtype == "CNAME":
+        response.add_answer(
+            RR(
+                rname=question.qname,
+                rtype=QTYPE.CNAME,
+                rclass=1,
+                ttl=record["ttl"],
+                rdata=CNAME(record["value"]),
+            )
+        )
+
+        print(
+            f"cname name={qname} "
+            f"alias={record['value']}"
+        )
+
         return response
 
     response.header.rcode = RCODE.NXDOMAIN

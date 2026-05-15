@@ -18,3 +18,8 @@ records:
     type: A
     value: 10.0.0.20
     ttl: 30
+
+  - name: www.internal.test
+    type: CNAME
+    value: api.internal.test
+    ttl: 30
