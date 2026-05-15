@@ -178,7 +178,7 @@ fn resolve_once_with_delegation(
 }
 
 /// A問い合わせがNODATAだった場合、同じ名前のCNAMEを探し、
-/// CNAME先のAレコードまで問い合わせる
+/// CNAME chainを再帰的に追跡する
 fn resolve_cname_if_needed(
     auth_internal_addr: &str,
     request: &[u8],
@@ -194,43 +194,72 @@ fn resolve_cname_if_needed(
 
     println!("nodata response found. try cname lookup: {}", qname);
 
-    let cname_request = build_query_request(request, &qname, 5, qclass)?;
-    let cname_response = resolve_once_with_delegation(auth_internal_addr, &cname_request)?;
-
-    let Some(cname_answer) = extract_cname_answer(&cname_response) else {
-        println!("cname not found: {}", qname);
+    let Some((cname_answers, a_answer)) =
+        resolve_cname_chain(auth_internal_addr, request, &qname, qclass)?
+    else {
         return Ok(None);
     };
 
-    println!(
-        "cname found: {} -> {}",
-        qname, cname_answer.target_name
-    );
-
-    let a_request = build_query_request(request, &cname_answer.target_name, 1, qclass)?;
-    let a_response = resolve_once_with_delegation(auth_internal_addr, &a_request)?;
-
-    let Some(a_answer) = extract_a_answer(&a_response) else {
-        println!("cname target a record not found: {}", cname_answer.target_name);
-        return Ok(None);
-    };
-
-    println!(
-        "cname target a found: {} -> {}.{}.{}.{}",
-        a_answer.name,
-        a_answer.ip[0],
-        a_answer.ip[1],
-        a_answer.ip[2],
-        a_answer.ip[3]
-    );
-
-    let response = build_cname_a_response(request, &qname, qclass, &cname_answer, &a_answer)?;
+    let response = build_cname_chain_a_response(request, qclass, &cname_answers, &a_answer)?;
 
     Ok(Some(response))
 }
 
+/// CNAMEの追跡先もCNAMEだった場合、さらに追跡する。
+/// この段階では、あえて追跡回数の上限を設けない。
+fn resolve_cname_chain(
+    auth_internal_addr: &str,
+    original_request: &[u8],
+    start_name: &str,
+    qclass: u16,
+) -> std::io::Result<Option<(Vec<CnameAnswer>, AAnswer)>> {
+    let mut current_name = start_name.to_string();
+    let mut cname_answers = Vec::new();
+
+    loop {
+        let cname_request = build_query_request(original_request, &current_name, 5, qclass)?;
+        let cname_response = resolve_once_with_delegation(auth_internal_addr, &cname_request)?;
+
+        let Some(cname_answer) = extract_cname_answer(&cname_response) else {
+            println!("cname not found: {}", current_name);
+            return Ok(None);
+        };
+
+        println!(
+            "cname found: {} -> {}",
+            cname_answer.name, cname_answer.target_name
+        );
+
+        let a_request = build_query_request(original_request, &cname_answer.target_name, 1, qclass)?;
+        let a_response = resolve_once_with_delegation(auth_internal_addr, &a_request)?;
+
+        if let Some(a_answer) = extract_a_answer(&a_response) {
+            println!(
+                "cname target a found: {} -> {}.{}.{}.{}",
+                a_answer.name,
+                a_answer.ip[0],
+                a_answer.ip[1],
+                a_answer.ip[2],
+                a_answer.ip[3]
+            );
+
+            cname_answers.push(cname_answer);
+            return Ok(Some((cname_answers, a_answer)));
+        }
+
+        println!(
+            "cname target a record not found: {}",
+            cname_answer.target_name
+        );
+
+        current_name = cname_answer.target_name.clone();
+        cname_answers.push(cname_answer);
+    }
+}
+
 #[derive(Debug)]
 struct CnameAnswer {
+    name: String,
     target_name: String,
     ttl: u32,
 }
@@ -298,17 +327,17 @@ fn build_query_request(
     Ok(request)
 }
 
-fn build_cname_a_response(
+fn build_cname_chain_a_response(
     original_request: &[u8],
-    original_qname: &str,
     qclass: u16,
-    cname_answer: &CnameAnswer,
+    cname_answers: &[CnameAnswer],
     a_answer: &AAnswer,
 ) -> std::io::Result<Vec<u8>> {
     let question_end = skip_question(original_request).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid dns question")
     })?;
 
+    let answer_count = cname_answers.len() + 1;
     let mut response = Vec::new();
 
     response.extend_from_slice(&original_request[0..2]);
@@ -318,21 +347,23 @@ fn build_cname_a_response(
     response.push(0x00);
 
     response.extend_from_slice(&1u16.to_be_bytes());
-    response.extend_from_slice(&2u16.to_be_bytes());
+    response.extend_from_slice(&(answer_count as u16).to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes());
 
     response.extend_from_slice(&original_request[12..question_end]);
 
-    write_dns_name(&mut response, original_qname)?;
-    response.extend_from_slice(&5u16.to_be_bytes());
-    response.extend_from_slice(&qclass.to_be_bytes());
-    response.extend_from_slice(&cname_answer.ttl.to_be_bytes());
+    for cname_answer in cname_answers {
+        write_dns_name(&mut response, &cname_answer.name)?;
+        response.extend_from_slice(&5u16.to_be_bytes());
+        response.extend_from_slice(&qclass.to_be_bytes());
+        response.extend_from_slice(&cname_answer.ttl.to_be_bytes());
 
-    let mut cname_rdata = Vec::new();
-    write_dns_name(&mut cname_rdata, &cname_answer.target_name)?;
-    response.extend_from_slice(&(cname_rdata.len() as u16).to_be_bytes());
-    response.extend_from_slice(&cname_rdata);
+        let mut cname_rdata = Vec::new();
+        write_dns_name(&mut cname_rdata, &cname_answer.target_name)?;
+        response.extend_from_slice(&(cname_rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&cname_rdata);
+    }
 
     write_dns_name(&mut response, &a_answer.name)?;
     response.extend_from_slice(&1u16.to_be_bytes());
@@ -349,7 +380,7 @@ fn extract_cname_answer(packet: &[u8]) -> Option<CnameAnswer> {
     let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
 
     for _ in 0..ancount {
-        let (_name, next_offset) = read_dns_name(packet, offset)?;
+        let (name, next_offset) = read_dns_name(packet, offset)?;
         offset = next_offset;
 
         if offset + 10 > packet.len() {
@@ -373,7 +404,11 @@ fn extract_cname_answer(packet: &[u8]) -> Option<CnameAnswer> {
         if rr_type == 5 {
             let (target_name, _) = read_dns_name(packet, rdata_offset)?;
 
-            return Some(CnameAnswer { target_name, ttl });
+            return Some(CnameAnswer {
+                name,
+                target_name,
+                ttl,
+            });
         }
 
         offset = rdata_offset + rdlength;

@@ -23,3 +23,30 @@ records:
     type: CNAME
     value: api.internal.test
     ttl: 30
+
+  # ループ用のレコード
+  - name: a.internal.test
+    type: CNAME
+    value: b.internal.test
+    ttl: 30
+
+  - name: b.internal.test
+    type: CNAME
+    value: c.internal.test
+    ttl: 30
+
+  - name: c.internal.test
+    type: CNAME
+    value: a.internal.test
+    ttl: 30
+
+  # 再帰処理正常確認用
+  - name: x.internal.test
+    type: CNAME
+    value: y.internal.test
+    ttl: 30
+
+  - name: y.internal.test
+    type: CNAME
+    value: api.internal.test
+    ttl: 30
