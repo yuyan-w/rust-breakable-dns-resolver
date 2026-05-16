@@ -50,3 +50,9 @@ records:
     type: CNAME
     value: api.internal.test
     ttl: 30
+
+  # キャッシュ確認用
+  - name: herd.internal.test
+    type: A
+    value: 10.0.100.9
+    ttl: 30
