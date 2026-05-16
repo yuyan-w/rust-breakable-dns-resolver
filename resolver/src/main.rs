@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 mod cache;
@@ -8,7 +8,7 @@ mod dns;
 mod dns_packet;
 mod resolver;
 
-const MAX_WORKERS: usize = 16;
+const MAX_WORKERS: usize = 4;
 
 fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:33053")?;
