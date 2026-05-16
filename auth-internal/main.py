@@ -1,19 +1,42 @@
 import os
-import socket
-import time
-import threading
 import random
+import socket
+import struct
+import threading
+import time
 
 import yaml
-from dnslib import DNSRecord, RR, A, NS, CNAME, QTYPE, RCODE
+from dnslib import (
+    A,
+    CNAME,
+    DNSRecord,
+    NS,
+    QTYPE,
+    RCODE,
+    RR,
+    TXT,
+)
 
 LISTEN_ADDR = "0.0.0.0"
 LISTEN_PORT = 33053
 RECORDS_FILE = "records.yaml"
 
+MAX_UDP_SIZE = 512
+TXT_CHUNK_SIZE = 255
+TCP_RECV_SIZE = 4096
+
 
 def normalize_name(name: str) -> str:
     return name.rstrip(".").lower()
+
+
+def split_txt_value(value: str) -> list[str]:
+    text = "".join(value.splitlines())
+
+    return [
+        text[index : index + TXT_CHUNK_SIZE]
+        for index in range(0, len(text), TXT_CHUNK_SIZE)
+    ]
 
 
 def find_delegation(qname: str, records: dict[tuple[str, str], dict]):
@@ -72,17 +95,17 @@ def add_glue_record(
         f"value={glue_record['value']}"
     )
 
-def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> DNSRecord:
+
+def build_response(
+    request: DNSRecord,
+    records: dict[tuple[str, str], dict],
+) -> DNSRecord:
     question = request.q
     qname = normalize_name(str(question.qname))
     qtype = QTYPE[question.qtype]
 
     response = request.reply()
-
-    # 権威DNSとして応答する
     response.header.aa = 1
-
-    # 再帰問い合わせはしない
     response.header.ra = 0
 
     print(f"query name={qname} type={qtype}")
@@ -96,6 +119,7 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
             delegated_name, ns_record = delegation
 
             response.header.rcode = RCODE.NOERROR
+
             response.add_auth(
                 RR(
                     rname=delegated_name + ".",
@@ -108,9 +132,13 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
 
             add_glue_record(response, ns_record["value"], records)
 
-            print(f"delegation name={delegated_name} ns={ns_record['value']}")
+            print(
+                f"delegation name={delegated_name} "
+                f"ns={ns_record['value']}"
+            )
+
             return response
-        
+
         name_exists = any(name == qname for name, _ in records.keys())
 
         if name_exists:
@@ -120,6 +148,7 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
 
         response.header.rcode = RCODE.NXDOMAIN
         print(f"NXDOMAIN name={qname}")
+
         return response
 
     if qtype == "A":
@@ -132,7 +161,12 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
                 rdata=A(record["value"]),
             )
         )
-        print(f"answer name={qname} value={record['value']}")
+
+        print(
+            f"answer name={qname} "
+            f"value={record['value']}"
+        )
+
         return response
 
     if qtype == "CNAME":
@@ -153,8 +187,53 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
 
         return response
 
+    if qtype == "TXT":
+        chunks = split_txt_value(record["value"])
+
+        response.add_answer(
+            RR(
+                rname=question.qname,
+                rtype=QTYPE.TXT,
+                rclass=1,
+                ttl=record["ttl"],
+                rdata=TXT(chunks),
+            )
+        )
+
+        print(
+            f"txt name={qname} "
+            f"size={len(record['value'])} "
+            f"chunks={len(chunks)}"
+        )
+
+        return response
+
     response.header.rcode = RCODE.NXDOMAIN
     return response
+
+
+def truncate_udp_response_if_needed(
+    request: DNSRecord,
+    response: DNSRecord,
+) -> DNSRecord:
+    packed = response.pack()
+
+    if len(packed) <= MAX_UDP_SIZE:
+        return response
+
+    truncated = request.reply()
+    truncated.header.aa = response.header.aa
+    truncated.header.ra = response.header.ra
+    truncated.header.rcode = response.header.rcode
+    truncated.header.tc = 1
+
+    print(
+        f"truncate udp response "
+        f"size={len(packed)} "
+        f"max={MAX_UDP_SIZE}"
+    )
+
+    return truncated
 
 
 def apply_mode(mode: str) -> bool:
@@ -175,41 +254,134 @@ def apply_mode(mode: str) -> bool:
 
     return True
 
-def handle_request(sock, data, addr, records, mode):
+
+def receive_exactly(conn: socket.socket, size: int) -> bytes:
+    chunks = []
+
+    remaining = size
+
+    while remaining > 0:
+        chunk = conn.recv(remaining)
+
+        if not chunk:
+            raise ConnectionError("connection closed")
+
+        chunks.append(chunk)
+        remaining -= len(chunk)
+
+    return b"".join(chunks)
+
+
+def handle_udp_request(sock, data, addr, records, mode):
     try:
         request = DNSRecord.parse(data)
     except Exception as error:
-        print(f"parse error: {error}")
+        print(f"udp parse error: {error}")
         return
 
     should_respond = apply_mode(mode)
+
     if not should_respond:
         return
 
     response = build_response(request, records)
+    response = truncate_udp_response_if_needed(
+        request,
+        response,
+    )
+
     sock.sendto(response.pack(), addr)
 
-    print(f"sent response to {addr}")
+    print(f"sent udp response to {addr}")
+
+
+def handle_tcp_connection(conn, addr, records, mode):
+    with conn:
+        try:
+            length_bytes = receive_exactly(conn, 2)
+            request_length = struct.unpack("!H", length_bytes)[0]
+            request_data = receive_exactly(conn, request_length)
+
+            request = DNSRecord.parse(request_data)
+
+            should_respond = apply_mode(mode)
+
+            if not should_respond:
+                return
+
+            response = build_response(request, records)
+            response_data = response.pack()
+            response_length = struct.pack("!H", len(response_data))
+
+            conn.sendall(response_length + response_data)
+
+            print(
+                f"sent tcp response to {addr} "
+                f"size={len(response_data)}"
+            )
+
+        except Exception as error:
+            print(f"tcp error addr={addr} error={error}")
+
+
+def serve_udp(records, mode):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((LISTEN_ADDR, LISTEN_PORT))
+
+    print(f"start udp={LISTEN_ADDR}:{LISTEN_PORT}")
+
+    while True:
+        data, addr = sock.recvfrom(TCP_RECV_SIZE)
+
+        thread = threading.Thread(
+            target=handle_udp_request,
+            args=(sock, data, addr, records, mode),
+        )
+
+        thread.start()
+
+
+def serve_tcp(records, mode):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((LISTEN_ADDR, LISTEN_PORT))
+    sock.listen()
+
+    print(f"start tcp={LISTEN_ADDR}:{LISTEN_PORT}")
+
+    while True:
+        conn, addr = sock.accept()
+
+        thread = threading.Thread(
+            target=handle_tcp_connection,
+            args=(conn, addr, records, mode),
+        )
+
+        thread.start()
+
 
 def main() -> None:
     mode = os.getenv("AUTH_MODE", "normal")
     records = load_records()
 
-    print(f"start udp={LISTEN_ADDR}:{LISTEN_PORT}")
     print(f"mode={mode}")
     print(f"records={len(records)}")
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((LISTEN_ADDR, LISTEN_PORT))
+    udp_thread = threading.Thread(
+        target=serve_udp,
+        args=(records, mode),
+    )
 
-    while True:
-        data, addr = sock.recvfrom(512)
+    tcp_thread = threading.Thread(
+        target=serve_tcp,
+        args=(records, mode),
+    )
 
-        thread = threading.Thread(
-            target=handle_request,
-            args=(sock, data, addr, records, mode),
-        )
-        thread.start()
+    udp_thread.start()
+    tcp_thread.start()
+
+    udp_thread.join()
+    tcp_thread.join()
 
 
 if __name__ == "__main__":

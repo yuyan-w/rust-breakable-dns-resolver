@@ -4,6 +4,7 @@ services:
     container_name: resolver
     ports:
       - "33053:33053/udp"
+      - "33053:33053/tcp"
     volumes:
       - ./resolver:/app
       - resolver-target:/app/target
@@ -19,6 +20,7 @@ services:
     container_name: auth-internal
     ports:
       - "33054:33053/udp"
+      - "33054:33053/tcp"
     volumes:
       - ./auth-internal:/app
     environment:

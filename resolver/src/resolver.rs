@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 
 use crate::dns_packet;
@@ -177,7 +178,7 @@ async fn resolve_cname_chain(
 
 pub async fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
     for attempt in 1..=MAX_RETRIES {
-        println!("upstream request attempt={}", attempt);
+        println!("upstream udp request attempt={}", attempt);
 
         let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
         upstream_socket.send_to(request, auth_addr).await?;
@@ -192,18 +193,26 @@ pub async fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result
 
         match result {
             Ok(Ok((size, _))) => {
-                println!("upstream response received");
-                return Ok(buf[..size].to_vec());
+                let response = buf[..size].to_vec();
+
+                println!("upstream udp response received size={}", size);
+
+                if dns_packet::is_truncated_response(&response) {
+                    println!("upstream response has TC bit. retry with TCP");
+                    return forward_to_auth_tcp(auth_addr, request).await;
+                }
+
+                return Ok(response);
             }
             Ok(Err(error)) => {
                 println!(
-                    "upstream request failed attempt={} error={}",
+                    "upstream udp request failed attempt={} error={}",
                     attempt, error
                 );
             }
             Err(error) => {
                 println!(
-                    "upstream request timeout attempt={} error={}",
+                    "upstream udp request timeout attempt={} error={}",
                     attempt, error
                 );
             }
@@ -222,4 +231,41 @@ pub async fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result
         std::io::ErrorKind::TimedOut,
         "upstream request failed after retries",
     ))
+}
+
+async fn forward_to_auth_tcp(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+    let result = timeout(
+        Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS),
+        forward_to_auth_tcp_inner(auth_addr, request),
+    )
+    .await;
+
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("upstream tcp request timeout: {}", error),
+        )),
+    }
+}
+
+async fn forward_to_auth_tcp_inner(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(auth_addr).await?;
+
+    let request_length = request.len() as u16;
+
+    stream.write_all(&request_length.to_be_bytes()).await?;
+    stream.write_all(request).await?;
+
+    let mut length_buf = [0u8; 2];
+    stream.read_exact(&mut length_buf).await?;
+
+    let response_length = u16::from_be_bytes(length_buf) as usize;
+
+    let mut response = vec![0u8; response_length];
+    stream.read_exact(&mut response).await?;
+
+    println!("upstream tcp response received size={}", response_length);
+
+    Ok(response)
 }

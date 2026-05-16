@@ -545,3 +545,11 @@ fn find_answer_offset(packet: &[u8]) -> Option<usize> {
 
     Some(offset)
 }
+
+pub fn is_truncated_response(response: &[u8]) -> bool {
+    if response.len() < 4 {
+        return false;
+    }
+
+    response[2] & 0b0000_0010 != 0
+}
