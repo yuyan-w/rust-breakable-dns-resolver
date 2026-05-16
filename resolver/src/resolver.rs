@@ -1,12 +1,27 @@
 use std::net::UdpSocket;
+use std::time::Duration;
 
 use crate::dns_packet;
 
 const MAX_CNAME_DEPTH: usize = 5;
+const UPSTREAM_TIMEOUT_SECONDS: u64 = 2;
 
 /// auth-internalへ問い合わせし、
 /// 委任先NSと一致するGlueレコードがあれば問い合わせを続行する
 pub fn resolve_with_delegation(
+    auth_internal_addr: &str,
+    request: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    match resolve_with_delegation_inner(auth_internal_addr, request) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            println!("resolve failed. return SERVFAIL: {}", error);
+            dns_packet::build_servfail_response(request)
+        }
+    }
+}
+
+fn resolve_with_delegation_inner(
     auth_internal_addr: &str,
     request: &[u8],
 ) -> std::io::Result<Vec<u8>> {
@@ -162,8 +177,10 @@ fn resolve_cname_chain(
 }
 
 /// 権威DNSへ問い合わせを行い、レスポンスを取得する
-fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
     let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
+
+    upstream_socket.set_read_timeout(Some(Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS)))?;
 
     upstream_socket.send_to(request, auth_addr)?;
 
