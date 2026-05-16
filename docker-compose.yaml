@@ -15,6 +15,7 @@ services:
       dns-lab:
         ipv4_address: 10.0.0.2
     restart: unless-stopped
+
   auth-internal:
     build: ./auth-internal
     container_name: auth-internal
@@ -29,6 +30,7 @@ services:
       dns-lab:
         ipv4_address: 10.0.0.10
     restart: unless-stopped
+
   auth-dev:
     build: ./auth-dev
     container_name: auth-dev
@@ -41,6 +43,18 @@ services:
     networks:
       dns-lab:
         ipv4_address: 10.0.0.20
+    restart: unless-stopped
+
+  attacker:
+    build: ./attacker
+    container_name: attacker
+    volumes:
+      - ./attacker:/app
+    depends_on:
+      - resolver
+    networks:
+      dns-lab:
+        ipv4_address: 10.0.0.30
     restart: unless-stopped
 
 volumes:

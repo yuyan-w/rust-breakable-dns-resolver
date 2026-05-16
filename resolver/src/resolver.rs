@@ -11,6 +11,9 @@ const UPSTREAM_TIMEOUT_SECONDS: u64 = 2;
 const MAX_RETRIES: usize = 3;
 const RETRY_BACKOFF_BASE_SECONDS: u64 = 1;
 
+const VULNERABLE_QUERY_ID: u16 = 0x1234;
+const VULNERABLE_SOURCE_PORT: u16 = 40000;
+
 pub async fn resolve_with_delegation(
     auth_internal_addr: &str,
     request: &[u8],
@@ -180,57 +183,94 @@ pub async fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result
     for attempt in 1..=MAX_RETRIES {
         println!("upstream udp request attempt={}", attempt);
 
-        let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        upstream_socket.send_to(request, auth_addr).await?;
-
-        let mut buf = [0u8; 512];
-
-        let result = timeout(
-            Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS),
-            upstream_socket.recv_from(&mut buf),
-        )
-        .await;
-
-        match result {
-            Ok(Ok((size, _))) => {
-                let response = buf[..size].to_vec();
-
-                println!("upstream udp response received size={}", size);
-
-                if dns_packet::is_truncated_response(&response) {
-                    println!("upstream response has TC bit. retry with TCP");
-                    return forward_to_auth_tcp(auth_addr, request).await;
-                }
-
-                return Ok(response);
-            }
-            Ok(Err(error)) => {
+        let response = match forward_to_auth_udp_vulnerable(auth_addr, request).await {
+            Ok(response) => response,
+            Err(error) => {
                 println!(
                     "upstream udp request failed attempt={} error={}",
                     attempt, error
                 );
+
+                if attempt < MAX_RETRIES {
+                    let backoff_seconds =
+                        RETRY_BACKOFF_BASE_SECONDS * 2_u64.pow((attempt - 1) as u32);
+
+                    println!("wait before retry: {} seconds", backoff_seconds);
+
+                    sleep(Duration::from_secs(backoff_seconds)).await;
+                }
+
+                continue;
             }
-            Err(error) => {
-                println!(
-                    "upstream udp request timeout attempt={} error={}",
-                    attempt, error
-                );
-            }
+        };
+
+        if dns_packet::is_truncated_response(&response) {
+            println!("upstream response has TC bit. retry with TCP");
+            return forward_to_auth_tcp_vulnerable(auth_addr, request).await;
         }
 
-        if attempt < MAX_RETRIES {
-            let backoff_seconds = RETRY_BACKOFF_BASE_SECONDS * 2_u64.pow((attempt - 1) as u32);
-
-            println!("wait before retry: {} seconds", backoff_seconds);
-
-            sleep(Duration::from_secs(backoff_seconds)).await;
-        }
+        return Ok(response);
     }
 
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
         "upstream request failed after retries",
     ))
+}
+
+async fn forward_to_auth_udp_vulnerable(
+    auth_addr: &str,
+    client_request: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let mut upstream_request = client_request.to_vec();
+    overwrite_query_id(&mut upstream_request, VULNERABLE_QUERY_ID)?;
+
+    let local_addr = format!("0.0.0.0:{}", VULNERABLE_SOURCE_PORT);
+    let upstream_socket = UdpSocket::bind(&local_addr).await?;
+
+    println!(
+        "upstream udp request vulnerable id={} source_port={}",
+        VULNERABLE_QUERY_ID, VULNERABLE_SOURCE_PORT
+    );
+
+    upstream_socket
+        .send_to(&upstream_request, auth_addr)
+        .await?;
+
+    let mut buf = [0u8; 4096];
+
+    let result = timeout(
+        Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS),
+        upstream_socket.recv_from(&mut buf),
+    )
+    .await;
+
+    match result {
+        Ok(Ok((size, from))) => {
+            println!("upstream udp response accepted size={} from={}", size, from);
+
+            let response = buf[..size].to_vec();
+
+            Ok(dns_packet::replace_response_id(response, client_request))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("upstream udp request timeout: {}", error),
+        )),
+    }
+}
+
+async fn forward_to_auth_tcp_vulnerable(
+    auth_addr: &str,
+    client_request: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let mut upstream_request = client_request.to_vec();
+    overwrite_query_id(&mut upstream_request, VULNERABLE_QUERY_ID)?;
+
+    let response = forward_to_auth_tcp(auth_addr, &upstream_request).await?;
+
+    Ok(dns_packet::replace_response_id(response, client_request))
 }
 
 async fn forward_to_auth_tcp(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -268,4 +308,20 @@ async fn forward_to_auth_tcp_inner(auth_addr: &str, request: &[u8]) -> std::io::
     println!("upstream tcp response received size={}", response_length);
 
     Ok(response)
+}
+
+fn overwrite_query_id(packet: &mut [u8], query_id: u16) -> std::io::Result<()> {
+    if packet.len() < 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid dns packet",
+        ));
+    }
+
+    let query_id_bytes = query_id.to_be_bytes();
+
+    packet[0] = query_id_bytes[0];
+    packet[1] = query_id_bytes[1];
+
+    Ok(())
 }
