@@ -2,6 +2,7 @@ import os
 import socket
 import time
 import threading
+import random
 
 import yaml
 from dnslib import DNSRecord, RR, A, NS, CNAME, QTYPE, RCODE
@@ -164,6 +165,13 @@ def apply_mode(mode: str) -> bool:
     if mode == "drop":
         print("drop mode: no response")
         return False
+
+    if mode == "flaky":
+        if random.random() < 0.5:
+            print("flaky mode: sleep 3 seconds")
+            time.sleep(3)
+        else:
+            print("flaky mode: normal response")
 
     return True
 

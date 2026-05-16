@@ -5,6 +5,7 @@ use crate::dns_packet;
 
 const MAX_CNAME_DEPTH: usize = 5;
 const UPSTREAM_TIMEOUT_SECONDS: u64 = 2;
+const MAX_RETRIES: usize = 3;
 
 /// auth-internalへ問い合わせし、
 /// 委任先NSと一致するGlueレコードがあれば問い合わせを続行する
@@ -178,14 +179,33 @@ fn resolve_cname_chain(
 
 /// 権威DNSへ問い合わせを行い、レスポンスを取得する
 pub fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
-    let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
+    for attempt in 1..=MAX_RETRIES {
+        println!("upstream request attempt={}", attempt);
 
-    upstream_socket.set_read_timeout(Some(Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS)))?;
+        let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
 
-    upstream_socket.send_to(request, auth_addr)?;
+        upstream_socket.set_read_timeout(Some(Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS)))?;
 
-    let mut buf = [0u8; 512];
-    let (size, _) = upstream_socket.recv_from(&mut buf)?;
+        upstream_socket.send_to(request, auth_addr)?;
 
-    Ok(buf[..size].to_vec())
+        let mut buf = [0u8; 512];
+
+        match upstream_socket.recv_from(&mut buf) {
+            Ok((size, _)) => {
+                println!("upstream response received");
+                return Ok(buf[..size].to_vec());
+            }
+            Err(error) => {
+                println!(
+                    "upstream request timeout attempt={} error={}",
+                    attempt, error
+                );
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "upstream request failed after retries",
+    ))
 }
