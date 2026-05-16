@@ -6,6 +6,7 @@ use crate::dns_packet;
 const MAX_CNAME_DEPTH: usize = 5;
 const UPSTREAM_TIMEOUT_SECONDS: u64 = 2;
 const MAX_RETRIES: usize = 3;
+const RETRY_BACKOFF_BASE_SECONDS: u64 = 1;
 
 /// auth-internalへ問い合わせし、
 /// 委任先NSと一致するGlueレコードがあれば問い合わせを続行する
@@ -201,6 +202,14 @@ pub fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u
                     attempt, error
                 );
             }
+        }
+
+        if attempt < MAX_RETRIES {
+            let backoff_seconds = RETRY_BACKOFF_BASE_SECONDS * 2_u64.pow((attempt - 1) as u32);
+
+            println!("wait before retry: {} seconds", backoff_seconds);
+
+            std::thread::sleep(Duration::from_secs(backoff_seconds));
         }
     }
 
