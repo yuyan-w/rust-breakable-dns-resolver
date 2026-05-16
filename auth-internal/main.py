@@ -158,8 +158,8 @@ def build_response(request: DNSRecord, records: dict[tuple[str, str], dict]) -> 
 
 def apply_mode(mode: str) -> bool:
     if mode == "slow":
-        print("slow mode: sleep 2 seconds")
-        time.sleep(2)
+        print("slow mode: sleep 5 seconds")
+        time.sleep(5)
 
     if mode == "drop":
         print("drop mode: no response")
