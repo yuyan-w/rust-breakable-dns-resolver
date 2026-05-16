@@ -1,17 +1,19 @@
 use std::collections::HashMap;
-use std::net::UdpSocket;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{Arc, Mutex};
+
+use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 
 mod cache;
 mod dns;
 mod dns_packet;
 mod resolver;
 
-const MAX_WORKERS: usize = 4;
+const MAX_IN_FLIGHT_REQUESTS: usize = 100;
 
-fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:33053")?;
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> std::io::Result<()> {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:33053").await?);
     println!("DNS resolver running at 0.0.0.0:33053");
 
     let auth_internal_addr =
@@ -20,23 +22,20 @@ fn main() -> std::io::Result<()> {
     println!("auth internal addr: {}", auth_internal_addr);
 
     let cache: cache::Cache = Arc::new(Mutex::new(HashMap::new()));
-
-    let (tx, rx) = mpsc::sync_channel::<()>(MAX_WORKERS);
-    let rx = Arc::new(Mutex::new(rx));
+    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
 
     loop {
         let mut buf = [0u8; 512];
-        let (size, source) = socket.recv_from(&mut buf)?;
+        let (size, source) = socket.recv_from(&mut buf).await?;
 
         let request = buf[..size].to_vec();
-        let socket = socket.try_clone()?;
-        let tx = tx.clone();
-        let rx = Arc::clone(&rx);
+        let socket = Arc::clone(&socket);
         let auth_internal_addr = auth_internal_addr.clone();
         let cache = Arc::clone(&cache);
+        let semaphore = Arc::clone(&semaphore);
 
-        thread::spawn(move || {
-            tx.send(()).unwrap();
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
 
             match dns::parser::parse_dns_request(&request) {
                 Some(parsed) => {
@@ -54,9 +53,7 @@ fn main() -> std::io::Result<()> {
                                 dns_packet::replace_response_id(cached_entry.response, &request);
                             let response = dns_packet::replace_answer_ttl(response, remaining_ttl);
 
-                            socket.send_to(&response, source).unwrap();
-
-                            rx.lock().unwrap().recv().unwrap();
+                            socket.send_to(&response, source).await.unwrap();
                             return;
                         }
 
@@ -66,10 +63,10 @@ fn main() -> std::io::Result<()> {
 
                     println!("cache miss");
 
-                    match resolver::resolve_with_delegation(&auth_internal_addr, &request) {
+                    match resolver::resolve_with_delegation(&auth_internal_addr, &request).await {
                         Ok(response) => {
                             cache::store_if_cacheable(&cache, cache_key, &response);
-                            socket.send_to(&response, source).unwrap();
+                            socket.send_to(&response, source).await.unwrap();
                         }
                         Err(error) => {
                             println!("failed to resolve request: {}", error);
@@ -80,8 +77,6 @@ fn main() -> std::io::Result<()> {
                     println!("failed to parse dns request");
                 }
             }
-
-            rx.lock().unwrap().recv().unwrap();
         });
     }
 }

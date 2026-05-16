@@ -1,5 +1,7 @@
-use std::net::UdpSocket;
 use std::time::Duration;
+
+use tokio::net::UdpSocket;
+use tokio::time::{sleep, timeout};
 
 use crate::dns_packet;
 
@@ -8,13 +10,11 @@ const UPSTREAM_TIMEOUT_SECONDS: u64 = 2;
 const MAX_RETRIES: usize = 3;
 const RETRY_BACKOFF_BASE_SECONDS: u64 = 1;
 
-/// auth-internalへ問い合わせし、
-/// 委任先NSと一致するGlueレコードがあれば問い合わせを続行する
-pub fn resolve_with_delegation(
+pub async fn resolve_with_delegation(
     auth_internal_addr: &str,
     request: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    match resolve_with_delegation_inner(auth_internal_addr, request) {
+    match resolve_with_delegation_inner(auth_internal_addr, request).await {
         Ok(response) => Ok(response),
         Err(error) => {
             println!("resolve failed. return SERVFAIL: {}", error);
@@ -23,26 +23,24 @@ pub fn resolve_with_delegation(
     }
 }
 
-fn resolve_with_delegation_inner(
+async fn resolve_with_delegation_inner(
     auth_internal_addr: &str,
     request: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    let response = resolve_once_with_delegation(auth_internal_addr, request)?;
+    let response = resolve_once_with_delegation(auth_internal_addr, request).await?;
 
-    if let Some(response) = resolve_cname_if_needed(auth_internal_addr, request, &response)? {
+    if let Some(response) = resolve_cname_if_needed(auth_internal_addr, request, &response).await? {
         return Ok(response);
     }
 
     Ok(response)
 }
 
-/// auth-internalへ問い合わせし、
-/// 委任先NSと一致するGlueレコードがあれば問い合わせを続行する
-fn resolve_once_with_delegation(
+async fn resolve_once_with_delegation(
     auth_internal_addr: &str,
     request: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    let response = forward_to_auth(auth_internal_addr, request)?;
+    let response = forward_to_auth(auth_internal_addr, request).await?;
 
     if !dns_packet::is_referral_response(&response) {
         return Ok(response);
@@ -57,12 +55,10 @@ fn resolve_once_with_delegation(
 
     println!("trusted glue address found: {}", glue_addr);
 
-    forward_to_auth(&glue_addr, request)
+    forward_to_auth(&glue_addr, request).await
 }
 
-/// A問い合わせがNODATAだった場合、同じ名前のCNAMEを探し、
-/// CNAME chainを再帰的に追跡する
-fn resolve_cname_if_needed(
+async fn resolve_cname_if_needed(
     auth_internal_addr: &str,
     request: &[u8],
     response: &[u8],
@@ -77,7 +73,7 @@ fn resolve_cname_if_needed(
 
     println!("nodata response found. try cname lookup: {}", qname);
 
-    match resolve_cname_chain(auth_internal_addr, request, &qname, qclass)? {
+    match resolve_cname_chain(auth_internal_addr, request, &qname, qclass).await? {
         CnameChainResult::Resolved {
             cname_answers,
             a_answer,
@@ -115,9 +111,7 @@ enum CnameChainResult {
     },
 }
 
-/// CNAMEの追跡先もCNAMEだった場合、さらに追跡する。
-/// ただし無制限に追跡するとloopで終わらないため、最大追跡回数を設ける。
-fn resolve_cname_chain(
+async fn resolve_cname_chain(
     auth_internal_addr: &str,
     original_request: &[u8],
     start_name: &str,
@@ -129,7 +123,9 @@ fn resolve_cname_chain(
     for depth in 0..MAX_CNAME_DEPTH {
         let cname_request =
             dns_packet::build_query_request(original_request, &current_name, 5, qclass)?;
-        let cname_response = resolve_once_with_delegation(auth_internal_addr, &cname_request)?;
+
+        let cname_response =
+            resolve_once_with_delegation(auth_internal_addr, &cname_request).await?;
 
         let Some(cname_answer) = dns_packet::extract_cname_answer(&cname_response) else {
             println!("cname not found: {}", current_name);
@@ -149,7 +145,8 @@ fn resolve_cname_chain(
             1,
             qclass,
         )?;
-        let a_response = resolve_once_with_delegation(auth_internal_addr, &a_request)?;
+
+        let a_response = resolve_once_with_delegation(auth_internal_addr, &a_request).await?;
 
         if let Some(a_answer) = dns_packet::extract_a_answer(&a_response) {
             println!(
@@ -178,23 +175,31 @@ fn resolve_cname_chain(
     })
 }
 
-/// 権威DNSへ問い合わせを行い、レスポンスを取得する
-pub fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+pub async fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
     for attempt in 1..=MAX_RETRIES {
         println!("upstream request attempt={}", attempt);
 
-        let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
-
-        upstream_socket.set_read_timeout(Some(Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS)))?;
-
-        upstream_socket.send_to(request, auth_addr)?;
+        let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        upstream_socket.send_to(request, auth_addr).await?;
 
         let mut buf = [0u8; 512];
 
-        match upstream_socket.recv_from(&mut buf) {
-            Ok((size, _)) => {
+        let result = timeout(
+            Duration::from_secs(UPSTREAM_TIMEOUT_SECONDS),
+            upstream_socket.recv_from(&mut buf),
+        )
+        .await;
+
+        match result {
+            Ok(Ok((size, _))) => {
                 println!("upstream response received");
                 return Ok(buf[..size].to_vec());
+            }
+            Ok(Err(error)) => {
+                println!(
+                    "upstream request failed attempt={} error={}",
+                    attempt, error
+                );
             }
             Err(error) => {
                 println!(
@@ -209,7 +214,7 @@ pub fn forward_to_auth(auth_addr: &str, request: &[u8]) -> std::io::Result<Vec<u
 
             println!("wait before retry: {} seconds", backoff_seconds);
 
-            std::thread::sleep(Duration::from_secs(backoff_seconds));
+            sleep(Duration::from_secs(backoff_seconds)).await;
         }
     }
 
